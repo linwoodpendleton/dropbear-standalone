@@ -108,7 +108,8 @@ ssh -p 2222 -N -L 8080:127.0.0.1:80 admin@192.0.2.10 # 本地端口转发：电�
 
 完整选项表（English）见文末“[Options](#options)”。新增：`-U 用户名`、`-P 明文密码`（推荐改用 `-H`）、`-H crypt 哈希`
 （`$6$`/`$5$`）、`-k '公钥'`（可多次）、`-K authorized_keys 文件`（可多次）、`-s shell`、`-D home`。
-被占用的上游字母改到：pid 文件 `-P file` → **`-x file`**；keepalive `-K secs` → **`-n secs`**。
+被占用的上游字母改到：pid 文件 `-P file` → **`-x file`**；keepalive `-K secs` → **`-n secs`**；上游的 `-k`（禁止远程端口转发）→ **`-J`**。
+本版本的服务端**没有编入远程端口转发**（`ssh -R` 一律拒绝），所以 `-k` 用来传公钥不会和它冲突；`-J` 只在自行打开远程转发编译选项时才有意义。`-j`（禁止本地端口转发 `-L`）保持上游含义。
 
 ## 运行环境说明
 
@@ -497,7 +498,7 @@ Kept from upstream: `-p [addr:]port` (repeatable, up to 10; IPv6 as `[::1]:22`),
 `-t` require password **and** key, `-T n` maximum auth tries, `-j` disable `-L` forwarding, `-c cmd` forced command,
 `-l iface`, `-W`, `-I idle`, `-M maxtime`, `-z`, `-e`, `-Q`, `-V`, `-h`.
 
-Changed letters (they were taken by the new options): pid file `-P file` → **`-x file`** (default: no pid file);
+Changed letters (they were taken by the new options): pid file `-P file` → **`-x file`** (default: no pid file); upstream `-k` (disable remote port forwarding) → **`-J`** — the default server build has remote forwarding compiled out (`ssh -R` is always refused), so `-k` is free for inline public keys; `-j` (disable local `-L` forwarding) keeps its upstream meaning;
 keepalive `-K secs` → **`-n secs`**; authorized_keys directory `-D dir` → replaced by `-K file`;
 "disable password logins" `-s` → simply omit `-P`/`-H`.
 
