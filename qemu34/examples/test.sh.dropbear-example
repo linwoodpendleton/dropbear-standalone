@@ -1,0 +1,18 @@
+#!/bin/sh
+# Example /data/test.sh for the patched dropbear (copy, rename to test.sh, adjust).
+# /init runs it once after eth0 is up (10.0.2.15, host port PORT -> guest 22).
+# Files in the appended cpio land in /data/ (dropbearmulti, id.pub, ...).
+set -x
+cd /data
+ls -la /data /etc 2>&1
+./dropbearmulti dropbear -V 2>&1 | head -1
+./dropbearmulti dropbearkey -t ed25519 -f /tmp/hostkey >/dev/null || echo "TEST: dropbearkey FAILED"
+
+# Server in background, logs to the serial console. No /etc/passwd needed:
+# -U user / -D home / -s shell come from the command line.
+set --
+[ -f /data/id.pub ] && set -- -k "$(cat /data/id.pub)"
+./dropbearmulti dropbear -F -E -p 22 -r /tmp/hostkey -R \
+  -U tester -D /root -s /bin/sh -P 'test pass' "$@" &
+sleep 1
+netstat -ltn 2>/dev/null | grep ':22 ' && echo "TEST: dropbear listening"

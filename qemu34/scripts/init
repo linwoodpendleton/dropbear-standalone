@@ -1,0 +1,58 @@
+#!/bin/busybox sh
+# /init for the Linux 3.4 ARMv7 test initramfs.
+#
+# Kernel cmdline knobs (all optional):
+#   net=dhcp          use udhcpc on eth0 instead of static 10.0.2.15/24 gw 10.0.2.2
+#   testexit=poweroff after /data/test.sh returns, power the VM off (for scripted runs)
+#   testexit=shell    (default) drop to an interactive shell on the console
+#
+# Hook: if /data/test.sh exists (normally injected via a second cpio appended to
+# the initramfs), it is run once with its output on the console, after network is up.
+
+/bin/busybox mkdir -p /proc /sys /dev /tmp /root /var/run /var/log /sbin /usr/bin /usr/sbin /data
+/bin/busybox mount -t proc proc /proc
+/bin/busybox mount -t sysfs sysfs /sys
+/bin/busybox mount -t devtmpfs devtmpfs /dev 2>/dev/null || /bin/busybox echo "NK34: devtmpfs mount failed"
+/bin/busybox --install -s
+exec </dev/console >/dev/console 2>&1
+
+mkdir -p /dev/pts /dev/shm
+mount -t devpts -o gid=5,mode=620,ptmxmode=666 devpts /dev/pts
+mount -t tmpfs -o mode=1777 tmpfs /tmp
+mount -t tmpfs -o mode=1777 tmpfs /dev/shm
+[ -e /dev/ptmx ] || ln -s pts/ptmx /dev/ptmx
+chmod 0700 /root
+hostname nk34
+
+CMDLINE=$(cat /proc/cmdline)
+echo "NK34-INIT: kernel $(uname -r) $(uname -m); cmdline: $CMDLINE"
+echo "NK34-INIT: uptime $(cut -d' ' -f1 /proc/uptime)s"
+if [ -e /etc/passwd ]; then echo "NK34-INIT: /etc/passwd present"; else echo "NK34-INIT: NO /etc/passwd (intentional)"; fi
+
+ip link set lo up
+case " $CMDLINE " in
+  *" net=dhcp "*)
+    ip link set eth0 up
+    udhcpc -i eth0 -t 5 -T 2 -n -q -s /usr/share/udhcpc/default.script || echo "NK34-INIT: udhcpc failed" ;;
+  *)
+    ip link set eth0 up
+    ip addr add 10.0.2.15/24 dev eth0
+    ip route add default via 10.0.2.2 ;;
+esac
+echo "NK34-INIT: net: $(ip -4 addr show dev eth0 2>/dev/null | grep -o 'inet [0-9./]*')"
+
+if [ -f /data/test.sh ]; then
+  echo "NK34-INIT: running /data/test.sh"
+  sh /data/test.sh
+  echo "NK34-INIT: /data/test.sh exit=$?"
+fi
+
+case " $CMDLINE " in
+  *" testexit=poweroff "*) echo "NK34-INIT: poweroff"; sync; poweroff -f ;;
+esac
+
+echo "NK34-INIT: shell ready"
+while true; do
+  setsid cttyhack sh -l
+  echo "NK34-INIT: shell exited, respawning"
+done

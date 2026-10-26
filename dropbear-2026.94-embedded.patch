@@ -1,0 +1,2149 @@
+diff -ruN a/src/cli-auth.c b/src/cli-auth.c
+--- a/src/cli-auth.c
++++ b/src/cli-auth.c
+@@ -355,17 +355,22 @@
+ 		return password;
+ 	}
+ #endif
++	/* EMB: dropbear_exit (status 1) instead of dropbear_close (status 0):
++	   a login that could not even ask for the password is a failure */
+ 	if (cli_opts.batch_mode) {
+-		dropbear_close("BatchMode active, no interactive session possible.");
++		dropbear_exit("BatchMode active, no interactive session possible.");
+ 	}
+ 
+ 	if (!cli_opts.batch_mode) {
+ 		password = getpass(prompt);
+ 	}
+ 
++	if (password == NULL) {
++		dropbear_exit("No terminal to read a password from (use -i keyfile)");
++	}
+ 	/* 0x03 is a ctrl-c character in the buffer. */
+-	if (password == NULL || strchr(password, '\3') != NULL) {
+-		dropbear_close("Interrupted.");
++	if (strchr(password, '\3') != NULL) {
++		dropbear_exit("Interrupted.");
+ 	}
+ 	return password;
+ }
+diff -ruN a/src/cli-kex.c b/src/cli-kex.c
+--- a/src/cli-kex.c
++++ b/src/cli-kex.c
+@@ -251,9 +251,12 @@
+ 		response = getc(tty);
+ 		fclose(tty);
+ 	} else {
++		int c;
+ 		response = getc(stdin);
+-		/* flush stdin buffer */
+-		while ((getchar()) != '\n');
++		/* flush stdin buffer. EMB: also stop at EOF; upstream spins
++		   forever when there is no tty and stdin is at EOF (</dev/null) */
++		for (c = response; c != '\n' && c != EOF; c = getchar()) {
++		}
+ 	}
+ 
+ 	if (response == 'y') {
+@@ -313,8 +316,9 @@
+ 
+ 	if (hostsfile == NULL) {
+ 		TRACE(("hostsfile didn't open: %s", strerror(errno)))
++		/* EMB: say why instead of printing "(null)/.ssh/known_hosts" */
+ 		dropbear_log(LOG_WARNING, "Failed to open %s/.ssh/known_hosts",
+-				homedir);
++				homedir ? homedir : "$HOME (not set, no passwd entry)");
+ 		goto out;
+ 	}	
+ 
+diff -ruN a/src/cli-runopts.c b/src/cli-runopts.c
+--- a/src/cli-runopts.c
++++ b/src/cli-runopts.c
+@@ -30,6 +30,7 @@
+ #include "algo.h"
+ #include "forward.h"
+ #include "list.h"
++#include "ed25519.h" /* EMB: OpenSSH ed25519 identity files */
+ 
+ cli_runopts cli_opts; /* GLOBAL */
+ 
+@@ -557,18 +558,162 @@
+ }
+ 
+ #if DROPBEAR_CLI_PUBKEY_AUTH
++#if DROPBEAR_ED25519
++/* EMB: "dbclient -i" also takes an unencrypted OpenSSH ed25519 private key
++   ("-----BEGIN OPENSSH PRIVATE KEY-----", as written by ssh-keygen).
++   Upstream parses every identity file as a Dropbear key, and on an OpenSSH
++   key reads "----" as a string length and exits with "String too long".
++   Every length below is bounds-checked: a bad file is skipped with a
++   warning, it never ends the program. */
++#define EMB_OSSH_BEGIN "-----BEGIN OPENSSH PRIVATE KEY-----"
++#define EMB_OSSH_END "-----END OPENSSH PRIVATE KEY-----"
++#define EMB_OSSH_MAGIC "openssh-key-v1"
++
++/* one SSH string, without the exits of buf_getstring() */
++static int emb_getstr(buffer *b, const unsigned char **s, unsigned int *len) {
++	unsigned int n;
++	if (b->len - b->pos < 4) {
++		return DROPBEAR_FAILURE;
++	}
++	n = buf_getint(b);
++	if (n > b->len - b->pos) {
++		return DROPBEAR_FAILURE;
++	}
++	*s = buf_getptr(b, n);
++	*len = n;
++	buf_incrpos(b, n);
++	return DROPBEAR_SUCCESS;
++}
++
++static int emb_streq(const unsigned char *s, unsigned int len, const char *want) {
++	return len == strlen(want) && memcmp(s, want, len) == 0;
++}
++
++/* file holds the whole key file; on failure *why says what is wrong */
++static int emb_read_ossh_key(buffer *file, sign_key *key, const char **why) {
++	buffer *blob = NULL;
++	const unsigned char *s, *pub, *priv;
++	unsigned int len, publen, privlen, i, n = 0;
++	unsigned long outlen;
++	int ret = DROPBEAR_FAILURE;
++
++	*why = "malformed OpenSSH private key";
++	/* keep only the base64 text between the BEGIN and END lines */
++	for (i = strlen(EMB_OSSH_BEGIN); i < file->len && file->data[i] != '-'; i++) {
++		unsigned char c = file->data[i];
++		if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
++			continue;
++		}
++		file->data[n++] = c;
++	}
++	if (file->len - i < strlen(EMB_OSSH_END)
++			|| memcmp(&file->data[i], EMB_OSSH_END, strlen(EMB_OSSH_END)) != 0) {
++		goto out;
++	}
++	blob = buf_new(n + 4);
++	outlen = blob->size;
++	if (n == 0 || base64_decode(file->data, n, blob->data, &outlen) != CRYPT_OK) {
++		goto out;
++	}
++	buf_setlen(blob, outlen);
++
++	/* PROTOCOL.key: magic, cipher, kdf, kdf options, key count,
++	   public key, then the private section */
++	if (blob->len < sizeof(EMB_OSSH_MAGIC)
++			|| memcmp(blob->data, EMB_OSSH_MAGIC, sizeof(EMB_OSSH_MAGIC)) != 0) {
++		goto out;
++	}
++	buf_setpos(blob, sizeof(EMB_OSSH_MAGIC));
++	if (emb_getstr(blob, &s, &len) != DROPBEAR_SUCCESS) {
++		goto out;
++	}
++	if (!emb_streq(s, len, "none")) {
++		*why = "the key has a passphrase; remove it with 'ssh-keygen -p -N \"\" -f KEY' on a copy";
++		goto out;
++	}
++	if (emb_getstr(blob, &s, &len) != DROPBEAR_SUCCESS          /* kdf name */
++			|| emb_getstr(blob, &s, &len) != DROPBEAR_SUCCESS   /* kdf options */
++			|| blob->len - blob->pos < 4) {
++		goto out;
++	}
++	if (buf_getint(blob) != 1) {
++		*why = "only files with a single key are supported";
++		goto out;
++	}
++	if (emb_getstr(blob, &s, &len) != DROPBEAR_SUCCESS          /* public key */
++			|| emb_getstr(blob, &s, &len) != DROPBEAR_SUCCESS) { /* private section */
++		goto out;
++	}
++	/* continue inside the private section only */
++	buf_setlen(blob, (s - blob->data) + len);
++	buf_setpos(blob, s - blob->data);
++	if (blob->len - blob->pos < 8 || buf_getint(blob) != buf_getint(blob)) {
++		goto out;
++	}
++	if (emb_getstr(blob, &s, &len) != DROPBEAR_SUCCESS) {
++		goto out;
++	}
++	if (!emb_streq(s, len, "ssh-ed25519")) {
++		*why = "only ed25519 keys are supported by this build";
++		goto out;
++	}
++	if (emb_getstr(blob, &pub, &publen) != DROPBEAR_SUCCESS
++			|| emb_getstr(blob, &priv, &privlen) != DROPBEAR_SUCCESS
++			|| publen != CURVE25519_LEN || privlen != 2 * CURVE25519_LEN
++			|| memcmp(priv + CURVE25519_LEN, pub, CURVE25519_LEN) != 0) {
++		goto out;
++	}
++	key->ed25519key = m_malloc(sizeof(*key->ed25519key));
++	memcpy(key->ed25519key->priv, priv, CURVE25519_LEN);
++	memcpy(key->ed25519key->pub, pub, CURVE25519_LEN);
++	ret = DROPBEAR_SUCCESS;
++	*why = NULL;
++out:
++	if (blob) {
++		buf_burn_free(blob);
++	}
++	return ret;
++}
++#endif /* DROPBEAR_ED25519 */
++
+ void loadidentityfile(const char* filename, int warnfail) {
+ 	sign_key *key;
+ 	enum signkey_type keytype;
++	int ret = DROPBEAR_FAILURE, done = 0;
++	const char *why = NULL;
+ 
+ 	char *id_key_path = expand_homedir_path(filename);
+ 	TRACE(("loadidentityfile %s", id_key_path))
+ 
+ 	key = new_sign_key();
+ 	keytype = DROPBEAR_SIGNKEY_ANY;
+-	if ( readhostkey(id_key_path, key, &keytype) != DROPBEAR_SUCCESS ) {
++#if DROPBEAR_ED25519
++	{
++		/* EMB: look at the file before handing it to the Dropbear parser */
++		buffer *file = buf_new(4096);
++		if (buf_readfile(file, id_key_path) == DROPBEAR_SUCCESS) {
++			if (file->len >= strlen(EMB_OSSH_BEGIN)
++					&& memcmp(file->data, EMB_OSSH_BEGIN, strlen(EMB_OSSH_BEGIN)) == 0) {
++				ret = emb_read_ossh_key(file, key, &why);
++				keytype = DROPBEAR_SIGNKEY_ED25519;
++				done = 1;
++			} else if (file->len < 8 || file->data[0] || file->data[1]
++					|| file->data[2] || file->data[3] > 64) {
++				/* a Dropbear key starts with the length of its type name */
++				why = "not a Dropbear or OpenSSH private key";
++				done = 1;
++			}
++		}
++		buf_burn_free(file);
++	}
++#endif
++	if (!done) {
++		ret = readhostkey(id_key_path, key, &keytype);
++	}
++	if (ret != DROPBEAR_SUCCESS) {
+ 		if (warnfail) {
+-			dropbear_log(LOG_WARNING, "Failed loading keyfile '%s'\n", id_key_path);
++			dropbear_log(LOG_WARNING, "Failed loading keyfile '%s'%s%s\n", id_key_path,
++				why ? ": " : "", why ? why : "");
+ 		}
+ 		sign_key_free(key);
+ 		m_free(id_key_path);
+@@ -837,8 +982,22 @@
+ 	if (pw && pw->pw_name != NULL) {
+ 		cli_opts.own_user = m_strdup(pw->pw_name);
+ 	} else {
+-		dropbear_log(LOG_INFO, "Warning: failed to identify current user. Trying anyway.");
+-		cli_opts.own_user = m_strdup("unknown");
++		/* EMB: no passwd entry for our uid (normal on a bare embedded
++		   rootfs): default login name from $USER / $LOGNAME, then "root"
++		   for uid 0. Only used when no user is given on the command line. */
++		const char *u = getenv("USER");
++		if (u == NULL || *u == '\0') {
++			u = getenv("LOGNAME");
++		}
++		if ((u == NULL || *u == '\0') && uid == 0) {
++			u = "root";
++		}
++		if (u != NULL && *u != '\0') {
++			cli_opts.own_user = m_strdup(u);
++		} else {
++			dropbear_log(LOG_INFO, "Warning: failed to identify current user. Trying anyway.");
++			cli_opts.own_user = m_strdup("unknown");
++		}
+ 	}
+ 
+ }
+diff -ruN a/src/cli-session.c b/src/cli-session.c
+--- a/src/cli-session.c
++++ b/src/cli-session.c
+@@ -416,6 +416,13 @@
+ 	vsnprintf(exitmsg, sizeof(exitmsg), format, param);
+ 	TRACE(("Exited, cleaning up: %s", exitmsg))
+ 
++	/* EMB: a connection that ends before authentication succeeded (e.g. the
++	   server disconnects after too many wrong passwords) is a failure, even
++	   when it was closed "cleanly"; upstream exits 0 here */
++	if (exitcode == EXIT_SUCCESS && !ses.authstate.authdone) {
++		exitcode = EXIT_FAILURE;
++	}
++
+ 	/* Add the prefix depending on session/auth state */
+ 	if (!ses.init_done) {
+ 		snprintf(fullmsg, sizeof(fullmsg), "Exited: %s", exitmsg);
+diff -ruN a/src/dbmulti.c b/src/dbmulti.c
+--- a/src/dbmulti.c
++++ b/src/dbmulti.c
+@@ -24,6 +24,7 @@
+ 
+ #include "includes.h"
+ #include "dbutil.h"
++#include <sys/syscall.h> /* EMB: capget */
+ 
+ static int runprog(const char *multipath,
+ 		const char *progname, int argc, char ** argv, int *match) {
+@@ -60,8 +61,51 @@
+ 	return 1;
+ }
+ 
++/* EMB: this binary takes its login credentials from the command line and
++   runs every session as the uid that started it. Running it with more
++   privileges than the caller has (setuid/setgid bit, or file capabilities
++   beyond CAP_NET_BIND_SERVICE for a non-root caller) would hand any local
++   user a privileged shell or file writer (built-in scp), so refuse. */
++static void emb_refuse_elevated(void) {
++	struct { unsigned int version; int pid; } hdr = { 0x20080522, 0 };
++	struct { unsigned int eff, perm, inh; } data[2];
++	unsigned int i;
++
++	if (getuid() != geteuid() || getgid() != getegid()) {
++		fprintf(stderr, "Refusing to run setuid/setgid\n");
++		exit(1);
++	}
++	if (getuid() == 0) {
++		return;
++	}
++	memset(data, 0, sizeof(data));
++	if (syscall(SYS_capget, &hdr, data) != 0) {
++		return; /* kernel without capabilities */
++	}
++	for (i = 0; i < 2; i++) {
++		/* bit 10 = CAP_NET_BIND_SERVICE (bind port 22 as non-root) */
++		if ((data[i].perm | data[i].eff) & ~(i == 0 ? (1u << 10) : 0u)) {
++			fprintf(stderr, "Refusing to run with capabilities other than "
++				"cap_net_bind_service\n");
++			exit(1);
++		}
++	}
++}
++
+ int main(int argc, char ** argv) {
+ 	int i;
++	emb_refuse_elevated();
++	/* EMB: "dropbearmulti --applet <name> args..." always selects the applet,
++	   whatever this binary was renamed to (used for the built-in scp). */
++	if (argc > 2 && strcmp(argv[1], "--applet") == 0) {
++		int match, res;
++		res = runprog(argv[0], argv[2], argc-2, &argv[2], &match);
++		if (match == DROPBEAR_SUCCESS) {
++			return res;
++		}
++		fprintf(stderr, "Unknown applet '%s'\n", argv[2]);
++		exit(1);
++	}
+ 	for (i = 0; i < 2; i++) {
+ 		const char* multipath = NULL;
+ 		if (i == 1) {
+diff -ruN a/src/dbrandom.c b/src/dbrandom.c
+--- a/src/dbrandom.c
++++ b/src/dbrandom.c
+@@ -138,14 +138,20 @@
+ #endif
+ #if !DROPBEAR_USE_PRNGD
+ 	/* This is opportunistic, don't worry about failure */
++	/* EMB: never O_CREAT. In a bare rootfs without a /dev/urandom node,
++	   fopen("w") as root would create a regular file there, which a later
++	   start on a kernel without getrandom() would then "seed" from. */
+ 	unsigned char buf[INIT_SEED_SIZE];
+-	FILE *f = fopen(DROPBEAR_URANDOM_DEV, "w");
+-	if (!f) {
++	int fd = open(DROPBEAR_URANDOM_DEV, O_WRONLY | O_NOCTTY);
++	if (fd < 0) {
+ 		return;
+ 	}
+ 	genrandom(buf, sizeof(buf));
+-	fwrite(buf, sizeof(buf), 1, f);
+-	fclose(f);
++	if (write(fd, buf, sizeof(buf)) < 0) {
++		/* opportunistic, ignore */
++	}
++	m_burn(buf, sizeof(buf));
++	close(fd);
+ #endif
+ }
+ 
+@@ -255,6 +261,12 @@
+ 			urandom_seeded = 1;
+ 		}
+ #else
++		/* EMB: old kernels (no getrandom, e.g. 3.4) depend entirely on
++		   this node; refuse anything that is not a character device. */
++		struct stat st;
++		if (stat(DROPBEAR_URANDOM_DEV, &st) != 0 || !S_ISCHR(st.st_mode)) {
++			dropbear_exit("%s is missing or not a character device", DROPBEAR_URANDOM_DEV);
++		}
+ 		/* non-blocking random source (probably /dev/urandom) */
+ 		if (process_file(&hs, DROPBEAR_URANDOM_DEV, INIT_SEED_SIZE, 0) 
+ 				!= DROPBEAR_SUCCESS) {
+diff -ruN a/src/dropbearkey.c b/src/dropbearkey.c
+--- a/src/dropbearkey.c
++++ b/src/dropbearkey.c
+@@ -277,7 +277,8 @@
+ 	}
+ 
+ 	if (sizetext) {
+-		if (sscanf(sizetext, "%u", &bits) != 1) {
++		/* EMB: no sscanf (pulls in all of scanf) */
++		if (m_str_to_uint(sizetext, &bits) == DROPBEAR_FAILURE) {
+ 			fprintf(stderr, "Bits must be an integer\n");
+ 			exit(EXIT_FAILURE);
+ 		}
+diff -ruN a/src/includes.h b/src/includes.h
+--- a/src/includes.h
++++ b/src/includes.h
+@@ -190,6 +190,23 @@
+ 
+ #include "fake-rfc2553.h"
+ 
++#if EMB_NO_DNS
++/* EMB: numeric-only address handling (see netio.c). Avoids linking the
++   libc DNS resolver (~10 kB) and any dependency on /etc/resolv.conf,
++   /etc/hosts or /etc/services. Names other than "localhost" are refused. */
++#include <netdb.h>
++int emb_getaddrinfo(const char *node, const char *service,
++		const struct addrinfo *hints, struct addrinfo **res);
++void emb_freeaddrinfo(struct addrinfo *res);
++int emb_getnameinfo(const struct sockaddr *sa, socklen_t salen,
++		char *host, socklen_t hostlen, char *serv, socklen_t servlen, int flags);
++const char *emb_gai_strerror(int err);
++#define getaddrinfo emb_getaddrinfo
++#define freeaddrinfo emb_freeaddrinfo
++#define getnameinfo emb_getnameinfo
++#define gai_strerror emb_gai_strerror
++#endif
++
+ #include "fuzz.h"
+ 
+ #ifndef LOG_AUTHPRIV
+diff -ruN a/src/loginrec.c b/src/loginrec.c
+--- a/src/loginrec.c
++++ b/src/loginrec.c
+@@ -267,11 +267,10 @@
+ 
+ 	if (username) {
+ 		strlcpy(li->username, username, sizeof(li->username));
+-		pw = getpwnam(li->username);
+-		if (pw == NULL)
+-			dropbear_exit("login_init_entry: Cannot find user \"%s\"",
+-					li->username);
+-		li->uid = pw->pw_uid;
++		/* EMB: single-user server, sessions always run as our own uid;
++		   no /etc/passwd lookup */
++		(void)pw;
++		li->uid = geteuid();
+ 	}
+ 
+ 	if (hostname)
+diff -ruN a/src/netio.c b/src/netio.c
+--- a/src/netio.c
++++ b/src/netio.c
+@@ -767,3 +767,144 @@
+ 	}
+ }
+ 
++
++
++#if EMB_NO_DNS
++/* EMB: numeric-only replacements for getaddrinfo()/getnameinfo().
++ * Accepts NULL (wildcard with AI_PASSIVE, else loopback), "localhost",
++ * dotted IPv4 and IPv6 literals, and numeric ports. Results are IPv4
++ * first, then IPv6. */
++static struct addrinfo *emb_ai_new(int family, const struct addrinfo *hints,
++		unsigned int port, const void *addr) {
++	/* one allocation: addrinfo followed by the sockaddr */
++	struct addrinfo *ai = m_malloc(sizeof(struct addrinfo)
++			+ sizeof(struct sockaddr_storage));
++	struct sockaddr_storage *ss = (struct sockaddr_storage *)(ai + 1);
++
++	ai->ai_family = family;
++	ai->ai_socktype = (hints && hints->ai_socktype) ? hints->ai_socktype : SOCK_STREAM;
++	ai->ai_protocol = hints ? hints->ai_protocol : 0;
++	ai->ai_addr = (struct sockaddr *)ss;
++	if (family == AF_INET) {
++		struct sockaddr_in *sin = (struct sockaddr_in *)ss;
++		sin->sin_family = AF_INET;
++		sin->sin_port = htons(port);
++		memcpy(&sin->sin_addr, addr, 4);
++		ai->ai_addrlen = sizeof(*sin);
++	} else {
++		struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)ss;
++		sin6->sin6_family = AF_INET6;
++		sin6->sin6_port = htons(port);
++		memcpy(&sin6->sin6_addr, addr, 16);
++		ai->ai_addrlen = sizeof(*sin6);
++	}
++	return ai;
++}
++
++int emb_getaddrinfo(const char *node, const char *service,
++		const struct addrinfo *hints, struct addrinfo **res) {
++	int family = hints ? hints->ai_family : AF_UNSPEC;
++	int passive = hints && (hints->ai_flags & AI_PASSIVE);
++	unsigned int port = 0;
++	unsigned char a4[4], a6[16];
++	int have4 = 0, have6 = 0;
++	struct addrinfo *r4 = NULL, *r6 = NULL;
++
++	*res = NULL;
++	if (family != AF_UNSPEC && family != AF_INET && family != AF_INET6) {
++		return EAI_FAMILY;
++	}
++	if (service && m_str_to_uint(service, &port) == DROPBEAR_FAILURE) {
++		return EAI_SERVICE;
++	}
++	if (port > 65535) {
++		return EAI_SERVICE;
++	}
++
++	memset(a4, 0, sizeof(a4));
++	memset(a6, 0, sizeof(a6));
++	if (node == NULL || strcasecmp(node, "localhost") == 0) {
++		if (node || !passive) {
++			/* loopback */
++			a4[0] = 127; a4[3] = 1;
++			a6[15] = 1;
++		}
++		/* else wildcard: all zero */
++		have4 = have6 = 1;
++	} else if (inet_pton(AF_INET, node, a4) == 1) {
++		have4 = 1;
++	} else if (inet_pton(AF_INET6, node, a6) == 1) {
++		have6 = 1;
++	} else {
++		return EAI_NONAME;
++	}
++	if (family == AF_INET) {
++		have6 = 0;
++	} else if (family == AF_INET6) {
++		have4 = 0;
++	}
++	if (!have4 && !have6) {
++		return EAI_NONAME;
++	}
++	if (have4) {
++		r4 = emb_ai_new(AF_INET, hints, port, a4);
++	}
++	if (have6) {
++		r6 = emb_ai_new(AF_INET6, hints, port, a6);
++	}
++	if (r4) {
++		r4->ai_next = r6;
++		*res = r4;
++	} else {
++		*res = r6;
++	}
++	return 0;
++}
++
++void emb_freeaddrinfo(struct addrinfo *res) {
++	while (res) {
++		struct addrinfo *next = res->ai_next;
++		m_free(res);
++		res = next;
++	}
++}
++
++int emb_getnameinfo(const struct sockaddr *sa, socklen_t salen,
++		char *host, socklen_t hostlen, char *serv, socklen_t servlen, int flags) {
++	const void *addr;
++	unsigned int port;
++
++	if (flags & NI_NAMEREQD) {
++		return EAI_NONAME;
++	}
++	if (sa->sa_family == AF_INET && salen >= sizeof(struct sockaddr_in)) {
++		const struct sockaddr_in *sin = (const struct sockaddr_in *)sa;
++		addr = &sin->sin_addr;
++		port = ntohs(sin->sin_port);
++	} else if (sa->sa_family == AF_INET6 && salen >= sizeof(struct sockaddr_in6)) {
++		const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)sa;
++		addr = &sin6->sin6_addr;
++		port = ntohs(sin6->sin6_port);
++	} else {
++		return EAI_FAMILY;
++	}
++	if (host && hostlen && inet_ntop(sa->sa_family, addr, host, hostlen) == NULL) {
++		return EAI_OVERFLOW;
++	}
++	if (serv && servlen && snprintf(serv, servlen, "%u", port) >= (int)servlen) {
++		return EAI_OVERFLOW;
++	}
++	return 0;
++}
++
++const char *emb_gai_strerror(int err) {
++	switch (err) {
++		case EAI_NONAME:
++			return "host names are not supported by this build, use a numeric address or localhost";
++		case EAI_SERVICE:
++			return "port must be numeric";
++		default:
++			return "bad address";
++	}
++}
++#endif /* EMB_NO_DNS */
+diff -ruN a/src/runopts.h b/src/runopts.h
+--- a/src/runopts.h
++++ b/src/runopts.h
+@@ -138,11 +138,30 @@
+ 
+ 	int pass_on_env;
+ 
++	/* EMB: single-user embedded mode. The server only ever runs sessions as
++	   its own (effective) uid; the login identity below is synthesized at
++	   startup and does not need /etc/passwd, /etc/shadow or /etc/group. */
++	char *emb_user;      /* -U: the only accepted login name */
++	char *emb_home;      /* -D: home directory */
++	char *emb_shell;     /* -s: login shell */
++	char *emb_hash;      /* -H: crypt(3) hash ($5$/$6$...), NULL if unset */
++	int emb_have_plain;  /* -P / DROPBEAR_PASSWORD given */
++	unsigned char emb_plain_sha256[32]; /* sha256 of the plaintext password */
++	char *emb_keys[EMB_MAX_KEYS];        /* -k inline public keys */
++	int emb_num_keys;
++	char *emb_keyfiles[EMB_MAX_KEYFILES]; /* -K authorized_keys files */
++	int emb_num_keyfiles;
++	char *emb_selfpath;  /* absolute path of this binary, for builtin scp */
++	char *emb_hostkey_file; /* -R target: our own copy of the first -r path
++	                           (load_all_hostkeys() frees hostkey_files[]) */
++
+ } svr_runopts;
+ 
+ extern svr_runopts svr_opts;
+ 
+ void svr_getopts(int argc, char ** argv);
++void emb_set_selfpath(const char *argv0);
++char *emb_crypt(const char *key, const char *setting);
+ void loadhostkeys(void);
+ 
+ typedef struct cli_runopts {
+diff -ruN a/src/scp.c b/src/scp.c
+--- a/src/scp.c
++++ b/src/scp.c
+@@ -82,6 +82,19 @@
+ #include "scpmisc.h"
+ #include "progressmeter.h"
+ 
++#ifdef EMB_SCP_SERVER_ONLY
++/* EMB: no ssh command line is ever built in server-only mode */
++#define addargs(...) do { } while (0)
++#endif
++
++#if DROPBEAR_MULTI && defined(DBMULTI_dbclient) && defined(DBMULTI_dropbear)
++/* EMB: scp started on this machine runs the dbclient built into this same
++   binary (found like the server finds it for the built-in scp), so no
++   separate dbclient/ssh program has to exist in PATH. */
++#include "runopts.h"
++static const char *emb_scp_self = NULL;
++#endif
++
+ void bwlimit(int);
+ 
+ /* Struct for addargs */
+@@ -239,6 +252,12 @@
+ 		arg_setup(host, remuser, cmd);
+ #endif
+ 
++#if DROPBEAR_MULTI && defined(DBMULTI_dbclient) && defined(DBMULTI_dropbear)
++		/* argv[0] is "dbclient", which selects the applet in dbmulti */
++		if (emb_scp_self && strcmp(ssh_program, DROPBEAR_PATH_SSH_PROGRAM) == 0) {
++			execv(emb_scp_self, args.list);
++		}
++#endif
+ 		execvp(ssh_program, args.list);
+ 		perror(ssh_program);
+ #if DROPBEAR_VFORK
+@@ -315,7 +334,7 @@
+ #endif
+ {
+ 	int ch, fflag, tflag, status;
+-	double speed;
++	unsigned long speed;
+ 	char *targ, *endp;
+ 	extern char *optarg;
+ 	extern int optind;
+@@ -326,6 +345,10 @@
+ 	memset(&args, '\0', sizeof(args));
+ 	args.list = NULL;
+ 	addargs(&args, "%s", ssh_program);
++#if DROPBEAR_MULTI && defined(DBMULTI_dbclient) && defined(DBMULTI_dropbear)
++	emb_set_selfpath(argv[0]);
++	emb_scp_self = svr_opts.emb_selfpath;
++#endif
+ 
+ 	fflag = Tflag = tflag = 0;
+ 	while ((ch = getopt(argc, argv, "dfl:prtTvBCc:i:P:q1246S:o:F:")) != -1)
+@@ -351,8 +374,10 @@
+ 			fprintf(stderr, "Note: -B option is disabled in this version of scp");
+ 			break;
+ 		case 'l':
+-			speed = strtod(optarg, &endp);
+-			if (speed <= 0 || *endp != '\0')
++			/* EMB: integer Kbit/s, strtoul instead of strtod (which
++			   would pull in the libc float parser) */
++			speed = strtoul(optarg, &endp, 10);
++			if (speed == 0 || *endp != '\0')
+ 				usage();
+ 			limit_rate = speed * 1024;
+ 			break;
+@@ -417,6 +442,14 @@
+ 		sink(argc, argv, NULL);
+ 		exit(errs != 0);
+ 	}
++#ifdef EMB_SCP_SERVER_ONLY
++	/* EMB: built without an ssh client, so only the remote end of a copy
++	   (scp -t / scp -f, started by the server) is implemented. */
++	(void)targ; (void)status;
++	fprintf(stderr, "scp: this build only serves incoming scp (-t/-f); "
++		"run scp on the other machine, e.g. scp -O file user@host:/path\n");
++	exit(1);
++#else
+ 	if (argc < 2)
+ 		usage();
+ 	if (argc > 2)
+@@ -456,6 +489,7 @@
+ 		}
+ 	}
+ 	exit(errs != 0);
++#endif /* EMB_SCP_SERVER_ONLY */
+ }
+ #endif /* DBMULTI_scp stuff */
+ 
+@@ -1135,6 +1169,7 @@
+ 	(void) atomicio(vwrite, remout, "", 1);
+ 	if (stat(targ, &stb) == 0 && S_ISDIR(stb.st_mode))
+ 		targisdir = 1;
++#ifndef EMB_SCP_SERVER_ONLY
+ 	if (src != NULL && !iamrecursive && !Tflag) {
+ 		/*
+ 		 * Prepare to try to restrict incoming filenames to match
+@@ -1143,6 +1178,7 @@
+ 		if (brace_expand(src, &patterns, &npatterns) != 0)
+ 			fatal("%s: could not expand pattern", __func__);
+ 	}
++#endif
+ 	for (first = 1;; first = 0) {
+ 		cp = buf;
+ 		if (atomicio(read, remin, cp, 1) != 1)
+@@ -1225,6 +1261,8 @@
+ 			run_err("error: unexpected filename: %s", cp);
+ 			exit(1);
+ 		}
++#ifndef EMB_SCP_SERVER_ONLY
++		/* only used when we are the client (src != NULL) */
+ 		if (npatterns > 0) {
+ 			for (n = 0; n < npatterns; n++) {
+ 				if (fnmatch(patterns[n], cp, 0) == 0)
+@@ -1233,6 +1271,7 @@
+ 			if (n >= npatterns)
+ 				SCREWUP("filename does not match request");
+ 		}
++#endif
+ 		if (targisdir) {
+ 			static char *namebuf = NULL;
+ 			static size_t cursize = 0;
+diff -ruN a/src/sshpty.c b/src/sshpty.c
+--- a/src/sshpty.c
++++ b/src/sshpty.c
+@@ -360,16 +360,6 @@
+ 	mode_t mode;
+ 	struct stat st;
+ 
+-	/* Determine the group to make the owner of the tty. */
+-	grp = getgrnam("tty");
+-	if (grp) {
+-		gid = grp->gr_gid;
+-		mode = S_IRUSR | S_IWUSR | S_IWGRP;
+-	} else {
+-		gid = pw->pw_gid;
+-		mode = S_IRUSR | S_IWUSR | S_IWGRP | S_IWOTH;
+-	}
+-
+ 	/*
+ 	 * Change owner and mode of the tty as required.
+ 	 * Warn but continue if filesystem is read-only and the uids match/
+@@ -380,6 +370,20 @@
+ 				tty_name, strerror(errno));
+ 	}
+ 
++	/* EMB: no getgrnam("tty") (no /etc/group needed). devpts already gave
++	   the slave our uid and either its gid= mount option group (normally
++	   "tty") or our own gid. Keep that group; group-writable 0620 only when
++	   it is a separate tty group, private 0600 otherwise (upstream falls
++	   back to world-writable 0622 when there is no tty group). */
++	(void)grp;
++	if (st.st_gid != pw->pw_gid && st.st_gid != 0) {
++		gid = st.st_gid;
++		mode = S_IRUSR | S_IWUSR | S_IWGRP;
++	} else {
++		gid = pw->pw_gid;
++		mode = S_IRUSR | S_IWUSR;
++	}
++
+ 	/* Allow either "tty" gid or user's own gid. On Linux with openpty()
+ 	 * this varies depending on the devpts mount options */
+ 	if (st.st_uid != pw->pw_uid || !(st.st_gid == gid || st.st_gid == pw->pw_gid)) {
+diff -ruN a/src/svr-auth.c b/src/svr-auth.c
+--- a/src/svr-auth.c
++++ b/src/svr-auth.c
+@@ -37,6 +37,7 @@
+ #include "dbrandom.h"
+ 
+ static int checkusername(const char *username, unsigned int userlen);
++static void emb_fill_passwd(const char *username);
+ 
+ /* initialise the first time for a session, resetting all parameters */
+ void svr_authinitialise() {
+@@ -45,12 +46,37 @@
+ 	ses.authstate.authtypes |= AUTH_TYPE_PUBKEY;
+ #endif
+ #if DROPBEAR_SVR_PASSWORD_AUTH || DROPBEAR_SVR_PAM_AUTH
+-	if (!svr_opts.noauthpass) {
++	/* EMB: password auth is only offered when -P/-H/DROPBEAR_PASSWORD set */
++	if (!svr_opts.noauthpass
++			&& (svr_opts.emb_hash || svr_opts.emb_have_plain)) {
+ 		ses.authstate.authtypes |= AUTH_TYPE_PASSWORD;
+ 	}
+ #endif
+ }
+ 
++/* EMB: single-user replacement for fill_passwd(). The only existing user
++ * is svr_opts.emb_user, and it maps to the uid/gid the server runs as.
++ * No passwd/shadow/group database is consulted. */
++static void emb_fill_passwd(const char *username) {
++	m_free(ses.authstate.pw_name);
++	m_free(ses.authstate.pw_dir);
++	m_free(ses.authstate.pw_shell);
++	m_free(ses.authstate.pw_passwd);
++
++	if (strcmp(username, svr_opts.emb_user) != 0) {
++		/* pw_name == NULL means "no such user" */
++		return;
++	}
++	ses.authstate.pw_uid = geteuid();
++	ses.authstate.pw_gid = getegid();
++	ses.authstate.pw_name = m_strdup(svr_opts.emb_user);
++	ses.authstate.pw_dir = m_strdup(svr_opts.emb_home);
++	ses.authstate.pw_shell = m_strdup(svr_opts.emb_shell);
++	/* "!" never matches a crypt() result; the -P plaintext check does not
++	   use pw_passwd at all (see svr-authpasswd.c) */
++	ses.authstate.pw_passwd = m_strdup(svr_opts.emb_hash ? svr_opts.emb_hash : "!");
++}
++
+ /* Send a banner message if specified to the client. The client might
+  * ignore this, but possibly serves as a legal "no trespassing" sign */
+ void send_msg_userauth_banner(const buffer *banner) {
+@@ -243,7 +269,7 @@
+ 
+ 	if (ses.authstate.username == NULL) {
+ 		/* first request */
+-		fill_passwd(username);
++		emb_fill_passwd(username);
+ 		ses.authstate.username = m_strdup(username);
+ 	} else {
+ 		/* check username hasn't changed */
+@@ -312,6 +338,12 @@
+ 		usershell = "/bin/sh";
+ 	}
+ 
++	/* EMB: the shell comes from -s / $SHELL, not from /etc/passwd, so the
++	 * /etc/shells check (which may not even exist) is skipped. */
++	(void)listshell;
++	(void)usershell;
++#if 0
++
+ 	/* check the shell is valid. If /etc/shells doesn't exist, getusershell()
+ 	 * should return some standard shells like "/bin/sh" and "/bin/csh" (this
+ 	 * is platform-specific) */
+@@ -330,9 +362,7 @@
+ 	dropbear_log(LOG_WARNING, "User '%s' has invalid shell, rejected",
+ 				ses.authstate.pw_name);
+ 	return DROPBEAR_FAILURE;
+-	
+-goodshell:
+-	endusershell();
++#endif
+ 	TRACE(("matching shell"))
+ 
+ 	TRACE(("uid = %d", ses.authstate.pw_uid))
+@@ -478,7 +508,7 @@
+ 
+ }
+ 
+-#if DROPBEAR_SVR_DROP_PRIVS
++#if 0 /* EMB: unused, svr_switch_user() never switches */
+ /* Returns DROPBEAR_SUCCESS or DROPBEAR_FAILURE */
+ static int utmp_gid(gid_t *ret_gid) {
+ 	struct group *utmp_gr = getgrnam("utmp");
+@@ -501,6 +531,16 @@
+ void svr_switch_user(void) {
+ 	assert(ses.authstate.authdone);
+ 
++	/* EMB: single-user server. The session user is by construction the
++	   uid/gid we already run as (see emb_fill_passwd), so there is nothing
++	   to switch - and no initgroups()/getgrnam() that would need
++	   /etc/group. Refuse loudly if that invariant is ever broken. */
++	if (geteuid() != ses.authstate.pw_uid || getegid() != ses.authstate.pw_gid) {
++		dropbear_exit("Session user does not match server uid/gid");
++	}
++	return;
++#if 0
++
+ 	/* We can only change uid/gid as root ... */
+ 	if (getuid() == 0) {
+ 
+@@ -542,6 +582,7 @@
+ 			dropbear_exit("Couldn't	change user as non-root");
+ 		}
+ 	}
++#endif
+ }
+ 
+ void svr_raise_gid_utmp(void) {
+diff -ruN a/src/svr-authpasswd.c b/src/svr-authpasswd.c
+--- a/src/svr-authpasswd.c
++++ b/src/svr-authpasswd.c
+@@ -33,6 +33,189 @@
+ 
+ #if DROPBEAR_SVR_PASSWORD_AUTH
+ 
++/* EMB: SHA-crypt ("$5$" SHA-256 / "$6$" SHA-512, Ulrich Drepper's
++ * specification - the format of glibc/musl crypt(3), mkpasswd and
++ * "openssl passwd -5/-6") built on libtomcrypt's SHA-256/SHA-512, which are
++ * linked in anyway. Replaces libc crypt(), whose static version also drags
++ * in DES, MD5-crypt and bcrypt (~15 kB). Same limits as musl: salt <= 16
++ * chars, rounds 1000..9999999 (default 5000). */
++struct emb_hash {
++	int (*init)(hash_state *md);
++	int (*process)(hash_state *md, const unsigned char *in, unsigned long len);
++	int (*done)(hash_state *md, unsigned char *out);
++	unsigned int len;
++	const unsigned char *perm; /* output byte order, triples */
++	unsigned int nperm;
++};
++static const unsigned char emb_perm256[] = {
++	0,10,20, 21,1,11, 12,22,2, 3,13,23, 24,4,14,
++	15,25,5, 6,16,26, 27,7,17, 18,28,8, 9,19,29 };
++static const struct emb_hash emb_sha256 = {
++	sha256_init, sha256_process, sha256_done, 32, emb_perm256, 10 };
++#if DROPBEAR_SHA512
++static const unsigned char emb_perm512[] = {
++	0,21,42, 22,43,1, 44,2,23, 3,24,45, 25,46,4, 47,5,26, 6,27,48,
++	28,49,7, 50,8,29, 9,30,51, 31,52,10, 53,11,32, 12,33,54, 34,55,13,
++	56,14,35, 15,36,57, 37,58,16, 59,17,38, 18,39,60, 40,61,19, 62,20,41 };
++static const struct emb_hash emb_sha512 = {
++	sha512_init, sha512_process, sha512_done, 64, emb_perm512, 21 };
++#endif
++
++static char *emb_b64_24(char *p, unsigned long w, int n) {
++	static const char b64[] =
++		"./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
++	while (n-- > 0) {
++		*p++ = b64[w & 0x3f];
++		w >>= 6;
++	}
++	return p;
++}
++
++char *emb_crypt(const char *key, const char *setting) {
++	/* "$6$rounds=9999999$" + 16 salt + "$" + 86 + NUL */
++	static char out[128];
++	const struct emb_hash *h;
++	const unsigned char *k = (const unsigned char *)key;
++	const unsigned char *salt;
++	unsigned char A[64], B[64], DP[64], S[16];
++	unsigned char *P = NULL;
++	hash_state ctx;
++	unsigned long rounds = 5000, i;
++	size_t keylen = strlen(key), saltlen, cnt;
++	int custom = 0;
++	char *o = out;
++
++	if (setting[0] != '$' || setting[1] == '\0' || setting[2] != '$') {
++		return NULL;
++	}
++	if (setting[1] == '5') {
++		h = &emb_sha256;
++#if DROPBEAR_SHA512
++	} else if (setting[1] == '6') {
++		h = &emb_sha512;
++#endif
++	} else {
++		return NULL;
++	}
++	salt = (const unsigned char *)setting + 3;
++	if (strncmp((const char *)salt, "rounds=", 7) == 0) {
++		char *end = NULL;
++		if (!ascii_isdigit(salt[7])) {
++			return NULL;
++		}
++		rounds = strtoul((const char *)salt + 7, &end, 10);
++		if (*end != '$' || rounds > 9999999) {
++			return NULL;
++		}
++		if (rounds < 1000) {
++			rounds = 1000;
++		}
++		salt = (const unsigned char *)end + 1;
++		custom = 1;
++	}
++	for (saltlen = 0; saltlen < 16 && salt[saltlen] && salt[saltlen] != '$'; saltlen++) {
++		if (salt[saltlen] == '\n' || salt[saltlen] == ':') {
++			return NULL;
++		}
++	}
++	if (keylen > 256) {
++		return NULL;
++	}
++
++	/* B = H(key salt key) */
++	h->init(&ctx);
++	h->process(&ctx, k, keylen);
++	h->process(&ctx, salt, saltlen);
++	h->process(&ctx, k, keylen);
++	h->done(&ctx, B);
++
++	/* A = H(key salt B* bits(keylen)) */
++	h->init(&ctx);
++	h->process(&ctx, k, keylen);
++	h->process(&ctx, salt, saltlen);
++	for (cnt = keylen; cnt > h->len; cnt -= h->len) {
++		h->process(&ctx, B, h->len);
++	}
++	h->process(&ctx, B, cnt);
++	for (cnt = keylen; cnt > 0; cnt >>= 1) {
++		if (cnt & 1) {
++			h->process(&ctx, B, h->len);
++		} else {
++			h->process(&ctx, k, keylen);
++		}
++	}
++	h->done(&ctx, A);
++
++	/* P = H(key * keylen), stretched/cut to keylen */
++	h->init(&ctx);
++	for (i = 0; i < keylen; i++) {
++		h->process(&ctx, k, keylen);
++	}
++	h->done(&ctx, DP);
++	P = m_malloc(keylen + 1);
++	for (cnt = 0; cnt + h->len <= keylen; cnt += h->len) {
++		memcpy(P + cnt, DP, h->len);
++	}
++	memcpy(P + cnt, DP, keylen - cnt);
++
++	/* S = H(salt * (16 + A[0])), cut to saltlen */
++	h->init(&ctx);
++	for (i = 0; i < 16u + A[0]; i++) {
++		h->process(&ctx, salt, saltlen);
++	}
++	h->done(&ctx, DP);
++	memcpy(S, DP, saltlen);
++
++	for (i = 0; i < rounds; i++) {
++		h->init(&ctx);
++		if (i & 1) {
++			h->process(&ctx, P, keylen);
++		} else {
++			h->process(&ctx, A, h->len);
++		}
++		if (i % 3) {
++			h->process(&ctx, S, saltlen);
++		}
++		if (i % 7) {
++			h->process(&ctx, P, keylen);
++		}
++		if (i & 1) {
++			h->process(&ctx, A, h->len);
++		} else {
++			h->process(&ctx, P, keylen);
++		}
++		h->done(&ctx, A);
++	}
++
++	memcpy(o, setting, 3);
++	o += 3;
++	if (custom) {
++		o += snprintf(o, 20, "rounds=%lu$", rounds);
++	}
++	memcpy(o, salt, saltlen);
++	o += saltlen;
++	*o++ = '$';
++	for (i = 0; i < h->nperm; i++) {
++		const unsigned char *t = &h->perm[3*i];
++		o = emb_b64_24(o, ((unsigned long)A[t[0]] << 16) | (A[t[1]] << 8) | A[t[2]], 4);
++	}
++	if (h->len == 64) {
++		o = emb_b64_24(o, A[63], 2);
++	} else {
++		o = emb_b64_24(o, ((unsigned long)A[31] << 8) | A[30], 3);
++	}
++	*o = '\0';
++
++	m_burn(A, sizeof(A));
++	m_burn(B, sizeof(B));
++	m_burn(DP, sizeof(DP));
++	m_burn(S, sizeof(S));
++	m_burn(&ctx, sizeof(ctx));
++	m_burn(P, keylen);
++	m_free(P);
++	return out;
++}
++
+ /* not constant time when strings are differing lengths. 
+  string content isn't leaked, and crypt hashes are predictable length. */
+ static int constant_time_strcmp(const char* a, const char* b) {
+@@ -55,6 +238,7 @@
+ 	char * password = NULL;
+ 	unsigned int passwordlen;
+ 	unsigned int changepw;
++	int plain_ok = 0; /* EMB: result of the -P comparison */
+ 
+ 	/* check if client wants to change password */
+ 	changepw = buf_getbool(ses.payload);
+@@ -66,9 +250,28 @@
+ 
+ 	password = buf_getstring(ses.payload, &passwordlen);
+ 	if (valid_user && passwordlen <= DROPBEAR_MAX_PASSWORD_LEN) {
+-		/* the first bytes of passwdcrypt are the salt */
+-		passwdcrypt = ses.authstate.pw_passwd;
+-		testcrypt = crypt(password, passwdcrypt);
++		if (svr_opts.emb_have_plain) {
++			/* EMB: -P plaintext. Compare fixed-length SHA-256 digests with
++			   constant_time_memcmp(), so neither the content nor the length
++			   of the configured password leaks through timing. */
++			unsigned char digest[SHA256_HASH_SIZE];
++			hash_state hs;
++			sha256_init(&hs);
++			sha256_process(&hs, (const unsigned char*)password, passwordlen);
++			sha256_done(&hs, digest);
++			plain_ok = (constant_time_memcmp(digest, svr_opts.emb_plain_sha256,
++						SHA256_HASH_SIZE) == 0);
++			m_burn(digest, sizeof(digest));
++			m_burn(&hs, sizeof(hs));
++			/* non-NULL marks "a comparison was done" for the checks below */
++			passwdcrypt = ses.authstate.pw_passwd;
++			testcrypt = passwdcrypt;
++		} else if (svr_opts.emb_hash) {
++			/* the first bytes of passwdcrypt are the salt */
++			passwdcrypt = ses.authstate.pw_passwd;
++			testcrypt = emb_crypt(password, passwdcrypt);
++		}
++		/* else: no password configured, testcrypt stays NULL -> rejected */
+ 	}
+ 	m_burn(password, passwordlen);
+ 	m_free(password);
+@@ -80,6 +283,14 @@
+ 		return;
+ 	}
+ 
++	/* EMB: empty passwords never log in (-B has no effect in this build) */
++	if (passwordlen == 0) {
++		dropbear_log(LOG_WARNING, "Empty password attempt for '%s' from %s",
++				ses.authstate.pw_name, svr_ses.addrstring);
++		send_msg_userauth_failure(0, 1);
++		return;
++	}
++
+ 	if (passwordlen > DROPBEAR_MAX_PASSWORD_LEN) {
+ 		dropbear_log(LOG_WARNING,
+ 				"Too-long password attempt for '%s' from %s",
+@@ -105,7 +316,8 @@
+ 		return;
+ 	}
+ 
+-	if (constant_time_strcmp(testcrypt, passwdcrypt) == 0) {
++	if (svr_opts.emb_have_plain ? plain_ok
++			: (constant_time_strcmp(testcrypt, passwdcrypt) == 0)) {
+ 		if (svr_opts.multiauthmethod && (ses.authstate.authtypes & ~AUTH_TYPE_PASSWORD)) {
+ 			/* successful password authentication, but extra auth required */
+ 			dropbear_log(LOG_NOTICE,
+diff -ruN a/src/svr-authpubkey.c b/src/svr-authpubkey.c
+--- a/src/svr-authpubkey.c
++++ b/src/svr-authpubkey.c
+@@ -432,6 +432,16 @@
+ 
+ 	ret = cmp_base64_key(keyblob, keybloblen, (const unsigned char *) algo, algolen, line, NULL);
+ 
++#if !DROPBEAR_SVR_PUBKEY_OPTIONS_BUILT
++	/* EMB: options (command=, from=, no-pty...) are compiled out. Never
++	   grant unrestricted access for a key line that asked for restrictions. */
++	if (ret == DROPBEAR_SUCCESS && options_buf && options_buf->len > 0) {
++		dropbear_log(LOG_WARNING, "%s line %d: key options are not supported "
++			"in this build, key ignored", filename, line_num);
++		ret = DROPBEAR_FAILURE;
++	}
++#endif
++
+ 	/* free pubkey_info if it is filled */
+ 	if (ret == DROPBEAR_SUCCESS) {
+ #if DROPBEAR_SVR_PUBKEY_OPTIONS_BUILT
+@@ -477,8 +487,83 @@
+ 	return pathname;
+ }
+ 
++/* EMB: checkfileperm() on a path and each of its parent directories.
++   A sticky directory owned by us or root (like /tmp) is fine as a parent:
++   nobody else can rename or replace our file in it. */
++static int emb_checkpathperm(const char *path) {
++	char *p = m_strdup(path), *sep;
++	int ret = checkfileperm(p);
++	while (ret == DROPBEAR_SUCCESS && (sep = strrchr(p, '/')) != NULL) {
++		struct stat st;
++		if (sep == p) {
++			if (p[1] == '\0') {
++				break;
++			}
++			sep++;
++		}
++		*sep = '\0';
++		if (stat(p, &st) == 0 && S_ISDIR(st.st_mode) && (st.st_mode & S_ISVTX)
++				&& (st.st_uid == 0 || st.st_uid == ses.authstate.pw_uid)) {
++			continue;
++		}
++		ret = checkfileperm(p);
++	}
++	m_free(p);
++	return ret;
++}
++
++/* EMB: scan one opened authorized_keys stream */
++static int checkpubkey_stream(FILE *authfile, const char *filename,
++		const char* keyalgo, unsigned int keyalgolen,
++		const unsigned char* keyblob, unsigned int keybloblen,
++		struct PubKeyOptions **ret_options) {
++	int ret = DROPBEAR_FAILURE;
++	int line_num;
++	buffer *line = buf_new(MAX_AUTHKEYS_LINE);
++
++	/* iterate through the lines */
++	for (line_num = 1; line_num <= MAX_AUTHKEYS_LINE_COUNT; line_num++) {
++		if (buf_getline(line, authfile) == DROPBEAR_FAILURE) {
++			/* EOF reached */
++			TRACE(("checkpubkey: authorized_keys EOF reached"))
++			break;
++		}
++
++		ret = checkpubkey_line(line, line_num, filename, keyalgo, keyalgolen,
++			keyblob, keybloblen, ret_options);
++		if (ret == DROPBEAR_SUCCESS) {
++			break;
++		}
++	}
++
++	if (line_num > MAX_AUTHKEYS_LINE_COUNT) {
++		TRACE(("authorized_keys line limit"))
++	}
++	buf_free(line);
++	return ret;
++}
++
++/* EMB: open a file for reading without blocking on a FIFO */
++static FILE *emb_open_keyfile(const char *filename) {
++	FILE *authfile = NULL;
++	int fd = open(filename, O_RDONLY | O_NONBLOCK);
++	if (fd >= 0) {
++		authfile = fdopen(fd, "r");
++		if (!authfile) {
++			/* fdopen could fail with ENOMEM */
++			m_close(fd);
++		}
++	}
++	if (!authfile) {
++		TRACE(("checkpubkey: failed opening %s: %s", filename, strerror(errno)))
++	}
++	return authfile;
++}
++
+ /* Checks whether a specified publickey (and associated algorithm) is an
+- * acceptable key for authentication */
++ * acceptable key for authentication.
++ * EMB: sources, in order: -k inline keys, -K files; only when neither was
++ * given, the classic <home>/.ssh/authorized_keys. */
+ /* Returns DROPBEAR_SUCCESS if key is ok for auth, DROPBEAR_FAILURE otherwise */
+ static int checkpubkey(const char* keyalgo, unsigned int keyalgolen,
+ 		const unsigned char* keyblob, unsigned int keybloblen,
+@@ -487,13 +572,54 @@
+ 	FILE * authfile = NULL;
+ 	char * filename = NULL;
+ 	int ret = DROPBEAR_FAILURE;
+-	buffer * line = NULL;
+-	int line_num;
++	int i;
+ 	uid_t origuid;
+ 	gid_t origgid;
+ 
+ 	TRACE(("enter checkpubkey"))
+ 
++	/* -k 'ssh-ed25519 AAAA...' */
++	for (i = 0; i < svr_opts.emb_num_keys; i++) {
++		buffer *line;
++		size_t len = strlen(svr_opts.emb_keys[i]);
++		line = buf_new(len);
++		buf_putbytes(line, (const unsigned char*)svr_opts.emb_keys[i], len);
++		buf_setpos(line, 0);
++		ret = checkpubkey_line(line, i + 1, "-k", keyalgo, keyalgolen,
++			keyblob, keybloblen, ret_options);
++		buf_free(line);
++		if (ret == DROPBEAR_SUCCESS) {
++			TRACE(("leave checkpubkey: matched -k #%d", i + 1))
++			return ret;
++		}
++	}
++
++	/* -K file. The file and every directory above it must be owned by us
++	   or root and must not be group/world writable (else someone else could
++	   swap the file). */
++	for (i = 0; i < svr_opts.emb_num_keyfiles; i++) {
++		const char *kf = svr_opts.emb_keyfiles[i];
++		if (emb_checkpathperm(kf) != DROPBEAR_SUCCESS) {
++			continue;
++		}
++		authfile = emb_open_keyfile(kf);
++		if (authfile) {
++			ret = checkpubkey_stream(authfile, kf, keyalgo, keyalgolen,
++				keyblob, keybloblen, ret_options);
++			fclose(authfile);
++			authfile = NULL;
++			if (ret == DROPBEAR_SUCCESS) {
++				TRACE(("leave checkpubkey: matched -K %s", kf))
++				return ret;
++			}
++		}
++	}
++
++	if (svr_opts.emb_num_keys > 0 || svr_opts.emb_num_keyfiles > 0) {
++		TRACE(("leave checkpubkey: no -k/-K match"))
++		return DROPBEAR_FAILURE;
++	}
++
+ #if DROPBEAR_SVR_MULTIUSER
+ 	/* access the file as the authenticating user. */
+ 	origuid = getuid();
+@@ -507,21 +633,10 @@
+ 	if (checkpubkeyperms() == DROPBEAR_FAILURE) {
+ 		TRACE(("bad authorized_keys permissions, or file doesn't exist"))
+ 	} else {
+-		int fd;
+ 		/* we don't need to check pw and pw_dir for validity, since
+ 		 * its been done in checkpubkeyperms. */
+ 		filename = authorized_keys_filepath();
+-		fd = open(filename, O_RDONLY | O_NONBLOCK);
+-		if (fd >= 0) {
+-			authfile = fdopen(fd, "r");
+-			if (!authfile) {
+-				/* fdopen could fail with ENOMEM */
+-				m_close(fd);
+-			}
+-		}
+-		if (!authfile) {
+-			TRACE(("checkpubkey: failed opening %s: %s", filename, strerror(errno)))
+-		}
++		authfile = emb_open_keyfile(filename);
+ 	}
+ #if DROPBEAR_SVR_MULTIUSER
+ 	if ((seteuid(origuid)) < 0 ||
+@@ -535,34 +650,13 @@
+ 	}
+ 	TRACE(("checkpubkey: opened authorized_keys OK"))
+ 
+-	line = buf_new(MAX_AUTHKEYS_LINE);
+-
+-	/* iterate through the lines */
+-	for (line_num = 1; line_num <= MAX_AUTHKEYS_LINE_COUNT; line_num++) {
+-		if (buf_getline(line, authfile) == DROPBEAR_FAILURE) {
+-			/* EOF reached */
+-			TRACE(("checkpubkey: authorized_keys EOF reached"))
+-			break;
+-		}
+-
+-		ret = checkpubkey_line(line, line_num, filename, keyalgo, keyalgolen,
+-			keyblob, keybloblen, ret_options);
+-		if (ret == DROPBEAR_SUCCESS) {
+-			break;
+-		}
+-	}
+-
+-	if (line_num > MAX_AUTHKEYS_LINE_COUNT) {
+-		TRACE(("authorized_keys line limit"))
+-	}
++	ret = checkpubkey_stream(authfile, filename, keyalgo, keyalgolen,
++		keyblob, keybloblen, ret_options);
+ 
+ out:
+ 	if (authfile) {
+ 		fclose(authfile);
+ 	}
+-	if (line) {
+-		buf_free(line);
+-	}
+ 	m_free(filename);
+ 	TRACE(("leave checkpubkey: ret=%d", ret))
+ 	return ret;
+diff -ruN a/src/svr-chansession.c b/src/svr-chansession.c
+--- a/src/svr-chansession.c
++++ b/src/svr-chansession.c
+@@ -592,7 +592,8 @@
+ 
+ 	unsigned int termlen;
+ 	char namebuf[65];
+-	struct passwd * pw = NULL;
++	struct passwd pwent; /* EMB: synthesized, no getpwnam() */
++	struct passwd * pw = &pwent;
+ 
+ 	TRACE(("enter sessionpty"))
+ 
+@@ -622,9 +623,12 @@
+ 		dropbear_exit("Out of memory"); /* TODO disconnect */
+ 	}
+ 
+-	pw = getpwnam(ses.authstate.pw_name);
+-	if (!pw)
+-		dropbear_exit("getpwnam failed after succeeding previously");
++	memset(&pwent, 0, sizeof(pwent));
++	pwent.pw_name = ses.authstate.pw_name;
++	pwent.pw_uid = ses.authstate.pw_uid;
++	pwent.pw_gid = ses.authstate.pw_gid;
++	pwent.pw_dir = ses.authstate.pw_dir;
++	pwent.pw_shell = ses.authstate.pw_shell;
+ 	pty_setowner(pw, chansess->tty);
+ 
+ 	/* Set up the rows/col counts */
+@@ -1062,6 +1066,28 @@
+ #endif
+ 
+ 	usershell = m_strdup(get_user_shell());
++#ifdef DBMULTI_scp
++	/* EMB: serve "scp -t/-f ..." with our own built-in scp applet, so scp
++	   works with nothing but this one binary on the target. The shell still
++	   parses the (quoted) arguments; only the program is replaced. */
++	if (chansess->cmd && svr_opts.emb_selfpath
++			&& strncmp(chansess->cmd, "scp ", 4) == 0) {
++		buffer *b = buf_new(strlen(chansess->cmd) + 4 * strlen(svr_opts.emb_selfpath) + 40);
++		const char *c;
++		buf_putbytes(b, (const unsigned char*)"exec '", 6);
++		for (c = svr_opts.emb_selfpath; *c; c++) {
++			if (*c == '\'') {
++				buf_putbytes(b, (const unsigned char*)"'\\''", 4);
++			} else {
++				buf_putbyte(b, *c);
++			}
++		}
++		buf_putbytes(b, (const unsigned char*)"' --applet scp ", 15);
++		buf_putbytes(b, (const unsigned char*)&chansess->cmd[4], strlen(&chansess->cmd[4]));
++		buf_putbyte(b, '\0');
++		run_shell_command((const char*)b->data, ses.maxfd, usershell);
++	} else
++#endif
+ 	run_shell_command(chansess->cmd, ses.maxfd, usershell);
+ 
+ 	/* only reached on error */
+diff -ruN a/src/svr-kex.c b/src/svr-kex.c
+--- a/src/svr-kex.c
++++ b/src/svr-kex.c
+@@ -154,6 +154,15 @@
+ 			dropbear_assert(0);
+ 	}
+ 
++	/* EMB: with -r <file> -R, create the key in that file instead of the
++	   compiled-in /etc/dropbear path (which a non-root user can't write).
++	   Only one host key type is built in, so the first -r file is used.
++	   Not hostkey_files[0]: load_all_hostkeys() freed that at startup;
++	   emb_hostkey_file is a private copy made before (svr-runopts.c). */
++	if (svr_opts.emb_hostkey_file) {
++		fn = svr_opts.emb_hostkey_file;
++	}
++
+ 	expand_fn = expand_homedir_path(fn);
+ 
+ 	ret = readhostkey(expand_fn, svr_opts.hostkey, &type);
+diff -ruN a/src/svr-main.c b/src/svr-main.c
+--- a/src/svr-main.c
++++ b/src/svr-main.c
+@@ -59,8 +59,26 @@
+ 		dropbear_exit("Bad argc");
+ 	}
+ 
++#if INETD_MODE && defined(DISABLE_SYSLOG)
++	/* EMB: logs go to stderr; under inetd stderr is usually the client
++	   socket, where log lines would corrupt the SSH stream */
++	{
++		struct stat st;
++		if (fstat(STDERR_FILENO, &st) == 0 && S_ISSOCK(st.st_mode)) {
++			int fd = open("/dev/null", O_WRONLY);
++			if (fd >= 0) {
++				dup2(fd, STDERR_FILENO);
++				if (fd != STDERR_FILENO) {
++					close(fd);
++				}
++			}
++		}
++	}
++#endif
+ 	/* get commandline options */
+ 	svr_getopts(argc, argv);
++	/* EMB: remember where we are, before daemon() does chdir("/") */
++	emb_set_selfpath(multipath ? multipath : argv[0]);
+ 
+ #if INETD_MODE
+ 	/* service program mode */
+@@ -203,7 +221,7 @@
+ 	}
+ 
+ 	/* create a PID file so that we can be killed easily */
+-	pidfile = fopen(svr_opts.pidfile, "w");
++	pidfile = svr_opts.pidfile ? fopen(svr_opts.pidfile, "w") : NULL;
+ 	if (pidfile) {
+ 		fprintf(pidfile, "%d\n", getpid());
+ 		fclose(pidfile);
+@@ -230,7 +248,9 @@
+ 		val = select(maxsock+1, &fds, NULL, NULL, NULL);
+ 
+ 		if (ses.exitflag) {
+-			unlink(svr_opts.pidfile);
++			if (svr_opts.pidfile) {
++				unlink(svr_opts.pidfile);
++			}
+ 			dropbear_close("Terminated by signal");
+ 		}
+ 
+diff -ruN a/src/svr-runopts.c b/src/svr-runopts.c
+--- a/src/svr-runopts.c
++++ b/src/svr-runopts.c
+@@ -31,6 +31,7 @@
+ #include "ecdsa.h"
+ 
+ #include <grp.h>
++#include <pwd.h>
+ 
+ svr_runopts svr_opts; /* GLOBAL */
+ 
+@@ -39,6 +40,11 @@
+ static void loadhostkey(const char *keyfile, int fatal_duplicate);
+ static void addhostkey(const char *keyfile);
+ static void load_banner(void);
++static void emb_finish_opts(void);
++static void emb_add_key(const char *key);
++static void emb_add_keyfile(const char *file);
++static void emb_set_plain(char *arg);
++static void emb_set_hash(char *arg);
+ 
+ static void printhelp(const char * progname) {
+ 
+@@ -61,9 +67,20 @@
+ #if DROPBEAR_ED25519
+ 					"		- ed25519 %s\n"
+ #endif
++					"Single-user embedded options (no /etc/passwd, /etc/shadow needed):\n"
++					"-U user		The only accepted login name\n"
++					"		(default: name of the current uid, or 'root' if unknown)\n"
++					"-P password	Plaintext password (visible in ps until startup wipes it;\n"
++					"		-P @/path/file reads it from a file; env DROPBEAR_PASSWORD also works)\n"
++					"-H hash		crypt(3) password hash, e.g. '$6$salt$...' (preferred; -H @file ok)\n"
+ #if DROPBEAR_SVR_PUBKEY_AUTH
+-					"-D		Directory containing authorized_keys file\n"
+-#endif
++					"-k 'pubkey'	Accept this public key, e.g. 'ssh-ed25519 AAAA... me' (repeatable)\n"
++					"-K file		Accept keys from this authorized_keys file (repeatable)\n"
++					"		(without -k/-K: <home>/.ssh/authorized_keys)\n"
++#endif
++					"-s shell	Login shell (default: passwd entry, $SHELL, /bin/sh)\n"
++					"-D homedir	Home directory (default: passwd entry, $HOME, /)\n"
++					"		Without -P/-H password logins are disabled.\n"
+ #if DROPBEAR_DELAY_HOSTKEY
+ 					"-R		Create hostkeys as required\n" 
+ #endif
+@@ -82,7 +99,6 @@
+ 					"-G		Restrict logins to members of specified group\n"
+ #endif
+ #if DROPBEAR_SVR_PASSWORD_AUTH || DROPBEAR_SVR_PAM_AUTH
+-					"-s		Disable password logins\n"
+ 					"-g		Disable password logins for root\n"
+ 					"-B		Allow blank password logins\n"
+ 					"-t		Enable two-factor authentication (both password and public key required)\n"
+@@ -92,7 +108,7 @@
+ 					"-j		Disable local port/stream forwarding\n"
+ #endif
+ #if DROPBEAR_SVR_REMOTEANYFWD
+-					"-k		Disable remote port/stream forwarding\n"
++					"-J		Disable remote port/stream forwarding\n"
+ #endif
+ #if DROPBEAR_SVR_REMOTETCPFWD
+ 					"-a		Allow connections to forwarded ports from any host\n"
+@@ -102,8 +118,7 @@
+ 					"		Listen on specified tcp port (and optionally address),\n"
+ 					"		up to %d can be specified\n"
+ 					"		(default port is %s if none specified)\n"
+-					"-P PidFile	Create pid file PidFile\n"
+-					"		(default %s)\n"
++					"-x PidFile	Create pid file PidFile (default: none)\n"
+ #ifdef SO_BINDTODEVICE
+ 					"-l <interface>\n"
+ 					"		interface to bind on\n"
+@@ -112,7 +127,7 @@
+ 					"-i		Start for inetd\n"
+ #endif
+ 					"-W <receive_window_buffer> (default %d, larger may be faster, max 10MB)\n"
+-					"-K <keepalive>  (0 is never, default %d, in seconds)\n"
++					"-n <keepalive>  (0 is never, default %d, in seconds)\n"
+ 					"-I <idle_timeout>  (0 is never, default %d, in seconds)\n"
+ 					"-M <max_duration>  (0 is off, default %d, in seconds)\n"
+ 					"-z    disable QoS\n"
+@@ -139,7 +154,7 @@
+ 					ED25519_PRIV_FILENAME,
+ #endif
+ 					MAX_AUTH_TRIES,
+-					DROPBEAR_MAX_PORTS, DROPBEAR_DEFPORT, DROPBEAR_PIDFILE,
++					DROPBEAR_MAX_PORTS, DROPBEAR_DEFPORT,
+ 					DEFAULT_RECV_WINDOW, DEFAULT_KEEPALIVE, DEFAULT_IDLE_TIMEOUT,
+ 					DEFAULT_MAX_DURATION);
+ }
+@@ -157,6 +172,10 @@
+ 	char* reexec_fd_arg = NULL;
+ 	char* keyfile = NULL;
+ 	char *algo_print_arg = NULL;
++	char *emb_key_arg = NULL;
++	char *emb_keyfile_arg = NULL;
++	char *emb_plain_arg = NULL;
++	char *emb_hash_arg = NULL;
+ 	char c;
+ #if DROPBEAR_PLUGIN
+         char* pubkey_plugin = NULL;
+@@ -182,7 +201,7 @@
+ 	svr_opts.portcount = 0;
+ 	svr_opts.hostkey = NULL;
+ 	svr_opts.delay_hostkey = 0;
+-	svr_opts.pidfile = expand_homedir_path(DROPBEAR_PIDFILE);
++	svr_opts.pidfile = NULL; /* EMB: no pid file unless -x is given */
+ 	svr_opts.authorized_keys_dir = "~/.ssh";
+ #if DROPBEAR_SVR_LOCALANYFWD
+ 	svr_opts.nolocaltcp = 0;
+@@ -237,9 +256,28 @@
+ 				case 'r':
+ 					next = &keyfile;
+ 					break;
+-#if DROPBEAR_SVR_PUBKEY_AUTH
++				/* EMB: single-user options */
++				case 'U':
++					next = &svr_opts.emb_user;
++					break;
+ 				case 'D':
+-					next = &svr_opts.authorized_keys_dir;
++					next = &svr_opts.emb_home;
++					break;
++				case 's':
++					next = &svr_opts.emb_shell;
++					break;
++				case 'H':
++					next = &emb_hash_arg;
++					break;
++				case 'P':
++					next = &emb_plain_arg;
++					break;
++#if DROPBEAR_SVR_PUBKEY_AUTH
++				case 'k':
++					next = &emb_key_arg;
++					break;
++				case 'K':
++					next = &emb_keyfile_arg;
+ 					break;
+ #endif
+ 				case 'R':
+@@ -252,6 +290,10 @@
+ 				case 'E':
+ 					opts.usingsyslog = 0;
+ 					break;
++#else
++				case 'E':
++					/* EMB: always stderr, accept -E anyway */
++					break;
+ #endif
+ 				case 'e':
+ 					svr_opts.pass_on_env = 1;
+@@ -267,13 +309,9 @@
+ 					break;
+ #endif
+ #if DROPBEAR_SVR_REMOTEANYFWD
+-				case 'k':
++				case 'J':
+ 					svr_opts.noremotefwd = 1;
+ 					break;
+-#else
+-				case 'k':
+-					/* Ignore the flag */
+-					break;
+ #endif
+ #if DROPBEAR_SVR_REMOTETCPFWD
+ 				case 'a':
+@@ -294,7 +332,7 @@
+ 				case 'p':
+ 					nextisport = 1;
+ 					break;
+-				case 'P':
++				case 'x':
+ 					next = &svr_opts.pidfile;
+ 					break;
+ #ifdef SO_BINDTODEVICE
+@@ -322,7 +360,7 @@
+ 				case 'W':
+ 					next = &recv_window_arg;
+ 					break;
+-				case 'K':
++				case 'n':
+ 					next = &keepalive_arg;
+ 					break;
+ 				case 'I':
+@@ -335,9 +373,6 @@
+ 					next = &maxauthtries_arg;
+ 					break;
+ #if DROPBEAR_SVR_PASSWORD_AUTH || DROPBEAR_SVR_PAM_AUTH
+-				case 's':
+-					svr_opts.noauthpass = 1;
+-					break;
+ 				case 'g':
+ 					svr_opts.norootpass = 1;
+ 					break;
+@@ -348,7 +383,6 @@
+ 					svr_opts.multiauthmethod = 1;
+ 					break;
+ #else
+-				case 's':
+ 				case 'g':
+ 					break;
+ #endif
+@@ -412,6 +446,24 @@
+ 				addhostkey(keyfile);
+ 				keyfile = NULL;
+ 			}
++			if (emb_key_arg) {
++				emb_add_key(emb_key_arg);
++				emb_key_arg = NULL;
++			}
++			if (emb_keyfile_arg) {
++				emb_add_keyfile(emb_keyfile_arg);
++				emb_keyfile_arg = NULL;
++			}
++			if (emb_plain_arg) {
++				/* also wipes the argument from argv (ps / /proc/pid/cmdline) */
++				emb_set_plain(emb_plain_arg);
++				emb_plain_arg = NULL;
++			}
++			if (emb_hash_arg) {
++				/* copies it, then wipes a literal hash from argv */
++				emb_set_hash(emb_hash_arg);
++				emb_hash_arg = NULL;
++			}
+ 		}
+ 	}
+ 
+@@ -497,9 +549,7 @@
+ 		dropbear_exit("-t and -B are incompatible");
+ 	}
+ 
+-	if (strlen(svr_opts.authorized_keys_dir) == 0) {
+-		dropbear_exit("Bad -D");
+-	}
++	emb_finish_opts();
+ 
+ #if DROPBEAR_PLUGIN
+ 	if (pubkey_plugin) {
+@@ -661,6 +711,9 @@
+ 		char *hostkey_file = svr_opts.hostkey_files[i];
+ 		loadhostkey(hostkey_file, 1);
+ 		m_free(hostkey_file);
++		/* EMB: no dangling pointer left behind (the -R path that is
++		   needed later is kept separately in emb_hostkey_file) */
++		svr_opts.hostkey_files[i] = NULL;
+ 	}
+ 
+ 	/* Only load default host keys if a host key is not specified by the user */
+@@ -791,3 +844,329 @@
+ 	buf_setpos(svr_opts.banner, 0);
+ 
+ }
++
++
++/* ---------------------------------------------------------------------
++ * EMB: single-user embedded mode helpers.
++ * Everything below only runs at startup, in the listening process.
++ * ------------------------------------------------------------------- */
++
++/* Relative paths are made absolute now: in background mode daemon() does
++   chdir("/") before host keys (-R), key files or the pid file are used. */
++static char *emb_abspath(const char *path) {
++	char cwd[PATH_MAX];
++	char *ret;
++	if (path[0] == '/' || path[0] == '~' || getcwd(cwd, sizeof(cwd)) == NULL) {
++		return m_strdup(path);
++	}
++	ret = m_malloc(strlen(cwd) + strlen(path) + 2);
++	sprintf(ret, "%s/%s", cwd, path);
++	return ret;
++}
++
++/* Reads a small secret file (password or hash). Strips one trailing
++   newline (\n or \r\n). Returns a malloced string. */
++static char *emb_read_secret_file(const char *path) {
++	buffer *b = buf_new(DROPBEAR_MAX_PASSWORD_LEN + 200);
++	char *ret = NULL;
++	unsigned int len;
++	struct stat st;
++
++	if (buf_readfile(b, path) != DROPBEAR_SUCCESS) {
++		dropbear_exit("Can't read '%s': %s", path, strerror(errno));
++	}
++	if (stat(path, &st) == 0 && (st.st_mode & (S_IRGRP | S_IROTH))) {
++		dropbear_log(LOG_WARNING, "'%s' is readable by group/others, chmod 600 it", path);
++	}
++	len = b->len;
++	if (len == b->size) {
++		dropbear_exit("'%s' is too long", path);
++	}
++	if (len > 0 && b->data[len-1] == '\n') {
++		len--;
++		if (len > 0 && b->data[len-1] == '\r') {
++			len--;
++		}
++	}
++	if (memchr(b->data, '\0', len) != NULL || memchr(b->data, '\n', len) != NULL) {
++		dropbear_exit("'%s' must contain a single line", path);
++	}
++	ret = m_malloc(len + 1);
++	memcpy(ret, b->data, len);
++	ret[len] = '\0';
++	buf_burn_free(b);
++	return ret;
++}
++
++/* Stores sha256(password) for a constant-time comparison later and wipes
++   the plaintext. arg points into argv (or the environment) and is wiped
++   in place so it no longer shows in /proc/<pid>/cmdline or environ. */
++static void emb_set_plain(char *arg) {
++	char *pw = arg;
++	size_t len;
++	hash_state hs;
++
++	if (arg[0] == '@') {
++		pw = emb_read_secret_file(&arg[1]);
++	}
++	len = strlen(pw);
++	if (len == 0) {
++		dropbear_exit("Empty password is not allowed");
++	}
++	if (len > DROPBEAR_MAX_PASSWORD_LEN) {
++		dropbear_exit("Password too long (max %d)", DROPBEAR_MAX_PASSWORD_LEN);
++	}
++	sha256_init(&hs);
++	sha256_process(&hs, (const unsigned char*)pw, len);
++	sha256_done(&hs, svr_opts.emb_plain_sha256);
++	m_burn(&hs, sizeof(hs));
++	svr_opts.emb_have_plain = 1;
++
++	if (pw != arg) {
++		m_burn(pw, len);
++		m_free(pw);
++	} else {
++		m_burn(arg, len);
++	}
++}
++
++/* -H hash or -H @file. Keeps a private copy and wipes a literal hash from
++   argv right away (ps, /proc/<pid>/cmdline: a hash can still be attacked
++   offline); a repeated -H replaces the earlier one, which is wiped too. */
++static void emb_set_hash(char *arg) {
++	if (svr_opts.emb_hash) {
++		m_burn(svr_opts.emb_hash, strlen(svr_opts.emb_hash));
++		m_free(svr_opts.emb_hash);
++	}
++	if (arg[0] == '@') {
++		svr_opts.emb_hash = emb_read_secret_file(&arg[1]);
++	} else {
++		svr_opts.emb_hash = m_strdup(arg);
++		m_burn(arg, strlen(arg));
++	}
++}
++
++static void emb_add_key(const char *key) {
++	size_t len = strlen(key);
++	if (svr_opts.emb_num_keys >= EMB_MAX_KEYS) {
++		dropbear_exit("Too many -k keys (max %d)", EMB_MAX_KEYS);
++	}
++	const char *sp = strchr(key, ' ');
++	/* same limits as an authorized_keys line; must start with a key type
++	   this build supports (key options like command= are not accepted) */
++	if (len < 10 || len > 3000 || strchr(key, '\n') || strchr(key, '\r')
++			|| sp == NULL
++			|| signkey_type_from_name(key, sp - key) == DROPBEAR_SIGNKEY_NONE) {
++		dropbear_exit("Bad -k public key '%s' (expected 'ssh-ed25519 AAAA... [comment]')", key);
++	}
++	svr_opts.emb_keys[svr_opts.emb_num_keys++] = m_strdup(key);
++}
++
++static void emb_add_keyfile(const char *file) {
++	if (svr_opts.emb_num_keyfiles >= EMB_MAX_KEYFILES) {
++		dropbear_exit("Too many -K files (max %d)", EMB_MAX_KEYFILES);
++	}
++	if (file[0] == '\0') {
++		dropbear_exit("Bad -K");
++	}
++	if (access(file, R_OK) != 0) {
++		dropbear_log(LOG_WARNING, "-K %s is not readable (yet): %s", file, strerror(errno));
++	}
++	svr_opts.emb_keyfiles[svr_opts.emb_num_keyfiles++] = emb_abspath(file);
++}
++
++/* Fill in user/home/shell/password defaults. Does not require any
++   passwd/shadow/group database: getpwnam()/getpwuid() are only used to
++   pick nicer defaults when an entry for our own uid happens to exist. */
++static void emb_finish_opts(void) {
++	struct passwd *pw = NULL;
++	uid_t uid = geteuid();
++	const char *home = NULL, *shell = NULL;
++	char *envpw = getenv(DROPBEAR_PASSWORD_ENV);
++
++	/* -U/-D/-s point into argv: keep our own copies, so that nothing in
++	   svr_opts depends on argv contents (parts of argv are wiped) */
++	if (svr_opts.emb_user) {
++		svr_opts.emb_user = m_strdup(svr_opts.emb_user);
++	}
++	if (svr_opts.emb_home) {
++		svr_opts.emb_home = m_strdup(svr_opts.emb_home);
++	}
++	if (svr_opts.emb_shell) {
++		svr_opts.emb_shell = m_strdup(svr_opts.emb_shell);
++	}
++
++	if (svr_opts.emb_user == NULL) {
++		pw = getpwuid(uid);
++		if (pw && pw->pw_name && pw->pw_name[0]) {
++			svr_opts.emb_user = m_strdup(pw->pw_name);
++		} else {
++			svr_opts.emb_user = m_strdup("root");
++		}
++	} else {
++		pw = getpwnam(svr_opts.emb_user);
++		if (pw && pw->pw_uid != uid) {
++			if (uid == 0) {
++				/* started as root by mistake: "-U alice" would give alice a
++				   root shell. Sessions always run as the server's uid. */
++				dropbear_exit("-U %s is uid %d, but this server runs as root and "
++					"would give it a root shell; start the server as %s instead",
++					svr_opts.emb_user, (int)pw->pw_uid, svr_opts.emb_user);
++			}
++			/* some other account: borrow nothing from it */
++			pw = NULL;
++		}
++	}
++	{
++		const char *c = svr_opts.emb_user;
++		if (*c == '\0' || *c == '-' || strlen(c) > MAX_USERNAME_LEN) {
++			dropbear_exit("Bad -U user name");
++		}
++		for (; *c; c++) {
++			if (!(ascii_isalnum(*c) || strchr("._-@", *c))) {
++				dropbear_exit("Bad -U user name (allowed: A-Z a-z 0-9 . _ - @)");
++			}
++		}
++	}
++
++	if (svr_opts.emb_home == NULL) {
++		if (pw && pw->pw_dir && pw->pw_dir[0]) {
++			home = pw->pw_dir;
++		} else {
++			home = getenv("HOME");
++		}
++		svr_opts.emb_home = m_strdup((home && home[0]) ? home : "/");
++	}
++	if (svr_opts.emb_shell == NULL) {
++		if (pw && pw->pw_shell && pw->pw_shell[0]) {
++			shell = pw->pw_shell;
++		} else {
++			shell = getenv("SHELL");
++		}
++		svr_opts.emb_shell = m_strdup((shell && shell[0]) ? shell : "/bin/sh");
++	}
++	if (access(svr_opts.emb_shell, X_OK) != 0) {
++		dropbear_log(LOG_WARNING, "Login shell '%s' is not executable: %s",
++				svr_opts.emb_shell, strerror(errno));
++	}
++
++	/* Password: -P / -H / $DROPBEAR_PASSWORD. The env var is always removed
++	   so it can never leak into login sessions. */
++	if (envpw) {
++		if (!svr_opts.emb_have_plain && !svr_opts.emb_hash) {
++			emb_set_plain(envpw);
++		} else {
++			m_burn(envpw, strlen(envpw));
++		}
++		unsetenv(DROPBEAR_PASSWORD_ENV);
++	}
++	if (svr_opts.emb_hash) {
++		/* already our own copy (emb_set_hash) */
++		const char *h = svr_opts.emb_hash;
++		const char *probe = NULL;
++		const char *lastdollar = NULL;
++		if (svr_opts.emb_have_plain) {
++			dropbear_exit("-P (or DROPBEAR_PASSWORD) and -H can't be used together");
++		}
++		/* Must be a modular crypt hash, and crypt() must accept it:
++		   hashing anything with it must give a result of the same shape. */
++		lastdollar = strrchr(h, '$');
++		probe = (h[0] == '$' && lastdollar && lastdollar != h) ? emb_crypt("probe", h) : NULL;
++		if (probe == NULL || strlen(probe) != strlen(h)
++				|| strncmp(probe, h, lastdollar - h + 1) != 0) {
++			dropbear_exit("Unsupported -H hash; use a $6$ (SHA-512) or $5$ (SHA-256) crypt hash, "
++				"and quote it with single quotes in the shell");
++		}
++		probe = emb_crypt("", h);
++		if (probe && strcmp(probe, h) == 0) {
++			dropbear_exit("-H is the hash of an empty password, which is not allowed");
++		}
++	}
++#if DROPBEAR_SVR_PUBKEY_AUTH
++	if (!svr_opts.emb_hash && !svr_opts.emb_have_plain
++			&& svr_opts.emb_num_keys == 0 && svr_opts.emb_num_keyfiles == 0) {
++		dropbear_log(LOG_WARNING, "No -P/-H/-k/-K given: only %s/.ssh/authorized_keys "
++			"can be used to log in", svr_opts.emb_home);
++	}
++#else
++	if (!svr_opts.emb_hash && !svr_opts.emb_have_plain) {
++		dropbear_exit("No password configured (-P or -H)");
++	}
++#endif
++	{
++		int i;
++		for (i = 0; i < svr_opts.num_hostkey_files; i++) {
++			char *old = svr_opts.hostkey_files[i];
++			svr_opts.hostkey_files[i] = emb_abspath(old);
++			m_free(old);
++		}
++		if (svr_opts.pidfile) {
++			svr_opts.pidfile = emb_abspath(svr_opts.pidfile);
++		}
++		/* -R creates the key later, per connection (svr-kex.c), but
++		   load_all_hostkeys() m_free()s every hostkey_files[] entry at
++		   startup: keep a private copy of the target path. */
++		if (svr_opts.num_hostkey_files > 0) {
++			svr_opts.emb_hostkey_file = m_strdup(svr_opts.hostkey_files[0]);
++		}
++	}
++	dropbear_log(LOG_INFO, "Login '%s' runs as uid %d gid %d, home %s, shell %s%s",
++		svr_opts.emb_user, (int)uid, (int)getegid(), svr_opts.emb_home,
++		svr_opts.emb_shell, uid == 0 ? " (ROOT)" : "");
++}
++
++/* Records an absolute path to our own binary so that "scp" requested by
++   a client can be served by the built-in scp applet, even when no scp is
++   installed and /proc is not mounted. */
++void emb_set_selfpath(const char *argv0) {
++	char buf[PATH_MAX];
++	ssize_t n;
++
++	n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
++	if (n > 0 && buf[0] == '/') {
++		buf[n] = '\0';
++		if (strstr(buf, " (deleted)") == NULL) {
++			svr_opts.emb_selfpath = m_strdup(buf);
++			return;
++		}
++	}
++	if (argv0 == NULL || argv0[0] == '\0') {
++		return;
++	}
++	if (argv0[0] == '/') {
++		svr_opts.emb_selfpath = m_strdup(argv0);
++	} else if (strchr(argv0, '/')) {
++		char cwd[PATH_MAX];
++		if (getcwd(cwd, sizeof(cwd)) && strlen(cwd) + strlen(argv0) + 2 <= sizeof(buf)) {
++			snprintf(buf, sizeof(buf), "%s/%s", cwd, argv0);
++			svr_opts.emb_selfpath = m_strdup(buf);
++		}
++	} else {
++		/* search $PATH like execvp() does */
++		const char *path = getenv("PATH");
++		const char *p, *z;
++		if (!path) {
++			path = "/usr/local/bin:/bin:/usr/bin";
++		}
++		for (p = path; ; p = z + 1) {
++			size_t l;
++			z = strchr(p, ':');
++			if (!z) {
++				z = p + strlen(p);
++			}
++			l = z - p;
++			if (l > 0 && p[0] == '/' && l + strlen(argv0) + 2 <= sizeof(buf)) {
++				memcpy(buf, p, l);
++				buf[l] = '/';
++				strcpy(&buf[l+1], argv0);
++				if (access(buf, X_OK) == 0) {
++					svr_opts.emb_selfpath = m_strdup(buf);
++					break;
++				}
++			}
++			if (*z == '\0') {
++				break;
++			}
++		}
++	}
++}
+diff -ruN a/src/svr-session.c b/src/svr-session.c
+--- a/src/svr-session.c
++++ b/src/svr-session.c
+@@ -319,7 +319,7 @@
+ void svr_dropbear_log(int priority, const char* format, va_list param) {
+ 
+ 	char printbuf[1024];
+-	char datestr[20];
++	char datestr[32];
+ 	time_t timesec;
+ 	int havetrace = 0;
+ 
+@@ -338,17 +338,19 @@
+ #endif
+ 
+ 	if (!opts.usingsyslog || havetrace) {
+-		struct tm * local_tm = NULL;
++		/* EMB: UTC timestamp without localtime()/strftime(), which would
++		   pull in the whole timezone database code */
++		struct tm tmbuf;
+ 		timesec = time(NULL);
+-		local_tm = localtime(&timesec);
+-		if (local_tm == NULL
+-			|| strftime(datestr, sizeof(datestr), "%b %d %H:%M:%S", 
+-						local_tm) == 0)
+-		{
++		if (gmtime_r(&timesec, &tmbuf) != NULL) {
++			snprintf(datestr, sizeof(datestr), "%04d-%02d-%02d %02d:%02d:%02d",
++				tmbuf.tm_year + 1900, tmbuf.tm_mon + 1, tmbuf.tm_mday,
++				tmbuf.tm_hour, tmbuf.tm_min, tmbuf.tm_sec);
++		} else {
+ 			/* upon failure, just print the epoch-seconds time. */
+ 			snprintf(datestr, sizeof(datestr), "%d", (int)timesec);
+ 		}
+-		fprintf(stderr, "[%d] %s %s\n", getpid(), datestr, printbuf);
++		fprintf(stderr, "[%d] %sZ %s\n", getpid(), datestr, printbuf);
+ 	}
+ }
+ 
+diff -ruN a/src/sysoptions.h b/src/sysoptions.h
+--- a/src/sysoptions.h
++++ b/src/sysoptions.h
+@@ -459,6 +459,15 @@
+ #define DROPBEAR_MULTI 0
+ #endif
+ 
++/* EMB: numeric-only addresses, no libc resolver (see includes.h) */
++#ifndef EMB_NO_DNS
++#define EMB_NO_DNS 0
++#endif
++
++/* EMB: limits for the single-user embedded options (-k / -K) */
++#define EMB_MAX_KEYS 16
++#define EMB_MAX_KEYFILES 4
++
+ /* To avoid denial of service */
+ #define DROPBEAR_MAX_LINE_LENGTH 10000
+ #define MAX_AUTHKEYS_LINE_COUNT 300
